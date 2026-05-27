@@ -725,6 +725,22 @@ async function syncAllPayments(req, res, next) {
   _syncLocks.add(schoolId);
   try {
     const summary = await syncPaymentsForSchool(req.school);
+
+    // Audit log
+    if (req.auditContext) {
+      await logAudit({
+        schoolId,
+        action: 'payment_manual_sync',
+        performedBy: req.auditContext.performedBy,
+        targetId: schoolId,
+        targetType: 'payment',
+        details: { syncResult: summary },
+        result: 'success',
+        ipAddress: req.auditContext.ipAddress,
+        userAgent: req.auditContext.userAgent,
+      });
+    }
+
     res.json({
       message: "Sync complete",
       summary: {
@@ -737,24 +753,6 @@ async function syncAllPayments(req, res, next) {
         failedDetails:   summary.failedDetails,
       },
     });
-    const result = await syncPaymentsForSchool(req.school);
-
-    // Audit log
-    if (req.auditContext) {
-      await logAudit({
-        schoolId,
-        action: 'payment_manual_sync',
-        performedBy: req.auditContext.performedBy,
-        targetId: schoolId,
-        targetType: 'payment',
-        details: { syncResult: result },
-        result: 'success',
-        ipAddress: req.auditContext.ipAddress,
-        userAgent: req.auditContext.userAgent,
-      });
-    }
-
-    res.json({ message: "Sync complete" });
   } catch (err) {
     // Audit log for failure
     if (req.auditContext) {
@@ -839,11 +837,13 @@ async function getStudentPayments(req, res, next) {
     const total = await Payment.countDocuments({
       schoolId: req.schoolId,
       studentId: req.params.studentId,
+      deletedAt: null,
     });
 
     const payments = await Payment.find({
       schoolId: req.schoolId,
       studentId: req.params.studentId,
+      deletedAt: null,
     })
       .sort({ confirmedAt: -1 })
       .skip(skip)
@@ -942,7 +942,7 @@ async function getStudentBalance(req, res, next) {
         .json({ error: "Student not found", code: "NOT_FOUND" });
 
     const result = await Payment.aggregate([
-      { $match: { schoolId, studentId } },
+      { $match: { schoolId, studentId, deletedAt: null } },
       {
         $group: {
           _id: null,
@@ -985,7 +985,7 @@ async function getStudentBalance(req, res, next) {
     if (student.fees && student.fees.length > 0) {
       // Get payments grouped by fee category
       const categoryPayments = await Payment.aggregate([
-        { $match: { schoolId, studentId, feeCategory: { $ne: null } } },
+        { $match: { schoolId, studentId, feeCategory: { $ne: null }, deletedAt: null } },
         {
           $group: {
             _id: "$feeCategory",
@@ -1166,7 +1166,7 @@ async function getAllPayments(req, res, next) {
       isSuspicious,
     } = req.query;
 
-    const filter = { schoolId, studentDeleted: { $ne: true } };
+    const filter = { schoolId, studentDeleted: { $ne: true }, deletedAt: null };
 
     if (startDate || endDate) {
       filter.confirmedAt = {};
@@ -1494,6 +1494,35 @@ function streamPaymentEvents(req, res) {
   });
 }
 
+/**
+ * GET /api/payments/stuck
+ * Admin-only. List payments in SUBMITTED status older than the threshold.
+ */
+async function getStuckPayments(req, res, next) {
+  try {
+    const { findStuckPayments, STUCK_PAYMENT_THRESHOLD_MS } = require('../services/stuckPaymentReconciliation');
+    
+    const stuckPayments = await findStuckPayments();
+    
+    res.json({
+      count: stuckPayments.length,
+      thresholdMs: STUCK_PAYMENT_THRESHOLD_MS,
+      thresholdMinutes: Math.round(STUCK_PAYMENT_THRESHOLD_MS / 60000),
+      payments: stuckPayments.map(p => ({
+        txHash: p.txHash,
+        studentId: p.studentId,
+        amount: p.amount,
+        status: p.status,
+        submittedAt: p.submittedAt,
+        confirmedAt: p.confirmedAt,
+        schoolId: p.schoolId,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Allowed manual status transitions: from → [to, ...]
 const ALLOWED_TRANSITIONS = {
   SUCCESS:   ['DISPUTED'],
@@ -1583,4 +1612,5 @@ module.exports = {
   streamPaymentEvents,
   getPaymentSummary,
   updatePaymentStatus,
+  getStuckPayments,
 };
